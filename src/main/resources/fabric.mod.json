@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "autocart",
+  "id": "shlawg",
   "version": "${version}",
-  "name": "Auto Cart",
-  "description": "Automated TNT minecart sequence toggled with a single key.",
-  "authors": [],
+  "name": "shlawg",
+  "description": "shlawg",
+  "authors": ["shlawg"],
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
