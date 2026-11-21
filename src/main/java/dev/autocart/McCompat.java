@@ -1,7 +1,6 @@
 package dev.autocart;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
@@ -56,11 +55,7 @@ final class McCompat {
 
     /** Right-click an entity the same way vanilla does: interactAt first, then interact if not consumed. */
     static boolean interactEntity(Minecraft mc, Entity target, Vec3 hitPoint) {
-        MultiPlayerGameMode gm = mc.gameMode;
-        InteractionResult r = gm.interactAt(mc.player, target, new EntityHitResult(target, hitPoint), InteractionHand.MAIN_HAND);
-        if (!r.consumesAction()) {
-            r = gm.interact(mc.player, target, InteractionHand.MAIN_HAND);
-        }
+              InteractionResult r = mc.gameMode.interact(mc.player, target, new EntityHitResult(target, hitPoint), InteractionHand.MAIN_HAND);
         return r.consumesAction();
     }
 
