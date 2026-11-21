@@ -233,24 +233,36 @@ final class AutoCartController {
         go(Stage.FIRE, 0);
     }
 
-    /** Switch to the crossbow and shoot at the cart position so the arrow passes through the fire cell. */
+    /** Switch to the crossbow, aim at the TNT minecart and fire so the shot passes through the fire cell. */
     private void fire(Minecraft mc) {
         LocalPlayer p = mc.player;
         if (!hold(mc, crossbowSlot, CROSSBOW)) { fail(mc, "charged crossbow not selectable"); return; }
 
         BlockPos firePos = spot.rail().relative(spot.facing().getOpposite());
-        Vec3 rc = spot.railCenter();
-        Vec3 aim = new Vec3(rc.x, rc.y + 0.25, rc.z); // inside the cart's hitbox
         Vec3 eye = p.getEyePosition();
 
-        if (new AABB(firePos).clip(eye, aim).isEmpty()) { fail(mc, "shot would not pass through the fire"); return; }
-        if (!McCompat.lineOfSight(mc, aim)) { fail(mc, "no line of sight for the shot"); return; }
+        // Target = real cart hitbox centre if the server already spawned it, otherwise where it spawns (on the rail).
+        Vec3 target = null;
+        for (Entity e : cartsNear(mc)) { target = e.getBoundingBox().getCenter(); break; }
+        if (target == null) {
+            Vec3 rc = spot.railCenter();
+            target = new Vec3(rc.x, rc.y + 0.35, rc.z);
+        }
+
+        // The shot must cross the fire cell before it reaches the cart.
+        if (new AABB(firePos).clip(eye, target).isEmpty()) { fail(mc, "shot would not pass through the fire"); return; }
+        if (!McCompat.lineOfSight(mc, target)) { fail(mc, "no line of sight for the shot"); return; }
+
+        // Arrow gravity compensation (crossbow arrow ~3.15 blocks/tick, gravity 0.05/tick).
+        double t = eye.distanceTo(target) / 3.15;
+        Vec3 aim = target.add(0, 0.05 * t * (t + 1.0) / 2.0, 0);
 
         Vec3 d = aim.subtract(eye);
         double horiz = Math.sqrt(d.x * d.x + d.z * d.z);
         float yaw = (float) (Math.toDegrees(Math.atan2(d.z, d.x)) - 90.0);
         float pitch = (float) -Math.toDegrees(Math.atan2(d.y, horiz));
 
+        // The use-item packet carries yaw/pitch, so the server aims the shot there; the camera is restored in the same tick.
         if (!McCompat.useItemAimed(mc, yaw, pitch)) { fail(mc, "crossbow use refused"); return; }
         go(Stage.VERIFY_FIRE, verifyWait(mc));
     }
