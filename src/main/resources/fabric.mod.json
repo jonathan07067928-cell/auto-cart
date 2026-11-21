@@ -6,6 +6,7 @@
   "description": "shlawg",
   "authors": ["shlawg"],
   "license": "MIT",
+  "icon": "assets/autocart/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
