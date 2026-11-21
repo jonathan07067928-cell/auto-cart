@@ -87,6 +87,13 @@ final class AutoCartController {
         LocalPlayer p = mc.player;
         if (p == null || mc.level == null || mc.gameMode == null) return;
         if (McCompat.screenOpen(mc)) return;
+
+        // Do not start at all unless both the rail and the fire behind it have valid space.
+        if (RailPlacement.find(mc, cfg).isEmpty()) {
+            LOGGER.warn("Not started: no valid space for rail + fire in front of the player.");
+            return;
+        }
+
         finalMsg = null;
         aimSent = false;
         inv.begin(p);
@@ -176,8 +183,9 @@ final class AutoCartController {
 
     private void placeRail(Minecraft mc) {
         if (!hold(mc, railSlot, RAIL)) { fail(mc, "could not select rail"); return; }
+        // Re-check rail AND fire positions right before placing anything.
         Optional<RailPlacement.Spot> found = RailPlacement.find(mc, cfg);
-        if (found.isEmpty()) { fail(mc, "no valid rail position in front of you"); return; }
+        if (found.isEmpty()) { fail(mc, "no valid space for rail + fire in front of you"); return; }
         spot = found.get();
         alignAim(mc); // aim at the cart's future position right now, before anything is placed
         if (!McCompat.useItemOn(mc, spot.placeHit())) { fail(mc, "rail placement refused"); return; }
@@ -186,6 +194,7 @@ final class AutoCartController {
 
     private void placeCart(Minecraft mc) {
         if (!mc.level.getBlockState(spot.rail()).is(BlockTags.RAILS)) { fail(mc, "rail disappeared"); return; }
+        if (!RailPlacement.fireValid(mc, spot)) { fail(mc, "fire position no longer valid"); return; }
         if (!hold(mc, cartSlot, CART)) { fail(mc, "could not select TNT minecart"); return; }
         if (!McCompat.useItemOn(mc, spot.cartHit())) { fail(mc, "minecart placement refused"); return; }
         lastPos = null;
