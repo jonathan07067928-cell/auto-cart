@@ -71,6 +71,10 @@ final class AutoCartController {
     private Vec3 lastPos;
     private int stuckTicks;
 
+    // last rotation sent to the server (so we only send when the aim actually changes)
+    private boolean aimSent;
+    private float sentYaw, sentPitch;
+
     AutoCartController(AutoCartConfig cfg) { this.cfg = cfg; }
 
     // ------------------------------------------------------------------ control
@@ -84,6 +88,7 @@ final class AutoCartController {
         if (p == null || mc.level == null || mc.gameMode == null) return;
         if (McCompat.screenOpen(mc)) return;
         finalMsg = null;
+        aimSent = false;
         inv.begin(p);
         enabled = true;
         go(Stage.PREPARE, 0);
@@ -116,6 +121,10 @@ final class AutoCartController {
         // Burst: keep running stages in this same tick until a stage has to wait.
         for (int guard = 0; guard < 16 && enabled && wait == 0; guard++) {
             Stage before = stage;
+
+            // Keep the character aimed at the cart from the moment the rail spot is known until the shot.
+            if (stage != Stage.VERIFY_FIRE) alignAim(mc);
+
             switch (stage) {
                 case PREPARE -> prepare(mc);
                 case PREPARE_VERIFY -> prepareVerify(mc);
@@ -170,6 +179,7 @@ final class AutoCartController {
         Optional<RailPlacement.Spot> found = RailPlacement.find(mc, cfg);
         if (found.isEmpty()) { fail(mc, "no valid rail position in front of you"); return; }
         spot = found.get();
+        alignAim(mc); // aim at the cart's future position right now, before anything is placed
         if (!McCompat.useItemOn(mc, spot.placeHit())) { fail(mc, "rail placement refused"); return; }
         go(Stage.PLACE_CART, 0);
     }
@@ -233,37 +243,24 @@ final class AutoCartController {
         go(Stage.FIRE, 0);
     }
 
-    /** Switch to the crossbow, aim at the TNT minecart and fire so the shot passes through the fire cell. */
+    /** Switch to the crossbow and fire along the already-aligned aim, through the fire cell, into the cart. */
     private void fire(Minecraft mc) {
         LocalPlayer p = mc.player;
         if (!hold(mc, crossbowSlot, CROSSBOW)) { fail(mc, "charged crossbow not selectable"); return; }
 
         BlockPos firePos = spot.rail().relative(spot.facing().getOpposite());
         Vec3 eye = p.getEyePosition();
-
-        // Target = real cart hitbox centre if the server already spawned it, otherwise where it spawns (on the rail).
-        Vec3 target = null;
-        for (Entity e : cartsNear(mc)) { target = e.getBoundingBox().getCenter(); break; }
-        if (target == null) {
-            Vec3 rc = spot.railCenter();
-            target = new Vec3(rc.x, rc.y + 0.35, rc.z);
-        }
+        Vec3 target = cartTarget(mc);
 
         // The shot must cross the fire cell before it reaches the cart.
         if (new AABB(firePos).clip(eye, target).isEmpty()) { fail(mc, "shot would not pass through the fire"); return; }
         if (!McCompat.lineOfSight(mc, target)) { fail(mc, "no line of sight for the shot"); return; }
 
-        // Arrow gravity compensation (crossbow arrow ~3.15 blocks/tick, gravity 0.05/tick).
-        double t = eye.distanceTo(target) / 3.15;
-        Vec3 aim = target.add(0, 0.05 * t * (t + 1.0) / 2.0, 0);
+        float[] a = aimAngles(mc);
+        alignAim(mc); // no-op if the server already has exactly this rotation
 
-        Vec3 d = aim.subtract(eye);
-        double horiz = Math.sqrt(d.x * d.x + d.z * d.z);
-        float yaw = (float) (Math.toDegrees(Math.atan2(d.z, d.x)) - 90.0);
-        float pitch = (float) -Math.toDegrees(Math.atan2(d.y, horiz));
-
-        // The use-item packet carries yaw/pitch, so the server aims the shot there; the camera is restored in the same tick.
-        if (!McCompat.useItemAimed(mc, yaw, pitch)) { fail(mc, "crossbow use refused"); return; }
+        // The use-item packet itself carries yaw/pitch too, so the shot is aimed server-side even if packets reorder.
+        if (!McCompat.useItemAimed(mc, a[0], a[1])) { fail(mc, "crossbow use refused"); return; }
         go(Stage.VERIFY_FIRE, verifyWait(mc));
     }
 
@@ -275,6 +272,39 @@ final class AutoCartController {
         if (stageTicks > cfg.verifyTimeoutTicks + McCompat.pingTicks(mc) * 2) {
             fail(mc, "crossbow did not fire");
         }
+    }
+
+    // ------------------------------------------------------------------ aiming
+
+    /** Real cart hitbox centre if the server already spawned it, otherwise where it will spawn (on the rail). */
+    private Vec3 cartTarget(Minecraft mc) {
+        for (Entity e : cartsNear(mc)) return e.getBoundingBox().getCenter();
+        Vec3 rc = spot.railCenter();
+        return new Vec3(rc.x, rc.y + 0.41, rc.z);
+    }
+
+    /** {yaw, pitch} from the eye to the cart, with arrow-drop compensation (~3.15 blocks/tick, gravity 0.05). */
+    private float[] aimAngles(Minecraft mc) {
+        Vec3 eye = mc.player.getEyePosition();
+        Vec3 target = cartTarget(mc);
+        double t = eye.distanceTo(target) / 3.15;
+        Vec3 aim = target.add(0, 0.05 * t * (t + 1.0) / 2.0, 0);
+        Vec3 d = aim.subtract(eye);
+        double horiz = Math.sqrt(d.x * d.x + d.z * d.z);
+        float yaw = (float) (Math.toDegrees(Math.atan2(d.z, d.x)) - 90.0);
+        float pitch = (float) -Math.toDegrees(Math.atan2(d.y, horiz));
+        return new float[] { yaw, pitch };
+    }
+
+    /** Sends the aim to the server as a normal rotation packet (camera untouched) whenever it changed. */
+    private void alignAim(Minecraft mc) {
+        if (spot == null) return;
+        float[] a = aimAngles(mc);
+        if (aimSent && Math.abs(a[0] - sentYaw) < 0.05f && Math.abs(a[1] - sentPitch) < 0.05f) return;
+        McCompat.sendRotation(mc, a[0], a[1]);
+        sentYaw = a[0];
+        sentPitch = a[1];
+        aimSent = true;
     }
 
     // ------------------------------------------------------------------ helpers
@@ -312,6 +342,7 @@ final class AutoCartController {
         stage = Stage.IDLE;
         cart = null;
         spot = null;
+        aimSent = false;
         finalMsg = message;
         holdTicks = 60;
         if (mc.player != null) show(mc);
