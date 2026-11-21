@@ -2,6 +2,8 @@ package dev.autocart;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.Entity;
@@ -10,6 +12,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,12 +24,12 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 /**
- * Runs the whole TNT minecart sequence as a state machine, one step per client tick.
- * Every "place/use" stage is followed by a VERIFY stage that checks real, server-confirmed
- * world/inventory state before the next stage is allowed to start.
+ * Runs the whole TNT minecart sequence as a state machine.
+ * Stages that do not need to wait run back-to-back inside a single client tick.
  */
 final class AutoCartController {
     private static final Logger LOGGER = LoggerFactory.getLogger("AutoCart");
+    private static final boolean SHOW_STATUS = false; // false = no ON/OFF/status text at all
 
     enum Stage {
         IDLE("Idle"),
@@ -36,8 +39,8 @@ final class AutoCartController {
         VERIFY_RAIL("Verifying rail"),
         PLACE_CART("Placing TNT minecart"),
         VERIFY_CART("Verifying minecart"),
-        MOVE_BEHIND("Moving behind minecart"),
-        IGNITE("Igniting with flint and steel"),
+        MOVE_BEHIND("Moving behind rail"),
+        IGNITE("Lighting fire behind rail"),
         VERIFY_IGNITE("Verifying ignition"),
         FIRE("Firing crossbow"),
         VERIFY_FIRE("Verifying shot");
@@ -56,20 +59,17 @@ final class AutoCartController {
 
     private boolean enabled;
     private Stage stage = Stage.IDLE;
-    private int wait;        // ticks still to wait before running the current stage
-    private int stageTicks;  // ticks spent in the current stage (including waiting)
+    private int wait;
+    private int stageTicks;
     private int overlayTimer;
-    private int holdTicks;   // keeps the final OFF/result message on screen for a moment
+    private int holdTicks;
     private String finalMsg;
 
-    // sequence data
     private int railSlot, cartSlot, flintSlot, crossbowSlot;
     private RailPlacement.Spot spot;
-    private Set<Integer> preexistingCarts = Set.of();
     private Entity cart;
     private Vec3 lastPos;
     private int stuckTicks;
-    private boolean warnedUnknownFuse;
 
     AutoCartController(AutoCartConfig cfg) { this.cfg = cfg; }
 
@@ -111,21 +111,23 @@ final class AutoCartController {
             return;
         }
         if (wait > 0) { wait--; return; }
-        if (McCompat.screenOpen(mc)) return; // paused while a GUI is open (timeout still counts)
+        if (McCompat.screenOpen(mc)) return;
 
-        switch (stage) {
-            case PREPARE -> prepare(mc);
-            case PREPARE_VERIFY -> prepareVerify(mc);
-            case PLACE_RAIL -> placeRail(mc);
-            case VERIFY_RAIL -> verifyRail(mc);
-            case PLACE_CART -> placeCart(mc);
-            case VERIFY_CART -> verifyCart(mc);
-            case MOVE_BEHIND -> moveBehind(mc);
-            case IGNITE -> ignite(mc);
-            case VERIFY_IGNITE -> verifyIgnite(mc);
-            case FIRE -> fire(mc);
-            case VERIFY_FIRE -> verifyFire(mc);
-            default -> { }
+        // Burst: keep running stages in this same tick until a stage has to wait.
+        for (int guard = 0; guard < 16 && enabled && wait == 0; guard++) {
+            Stage before = stage;
+            switch (stage) {
+                case PREPARE -> prepare(mc);
+                case PREPARE_VERIFY -> prepareVerify(mc);
+                case PLACE_RAIL -> placeRail(mc);
+                case PLACE_CART -> placeCart(mc);
+                case MOVE_BEHIND -> moveBehind(mc);
+                case IGNITE -> ignite(mc);
+                case FIRE -> fire(mc);
+                case VERIFY_FIRE -> verifyFire(mc);
+                default -> { }
+            }
+            if (stage == before) break; // stage is polling/walking, continue next tick
         }
     }
 
@@ -137,7 +139,7 @@ final class AutoCartController {
         if ((cartSlot = take(mc, CART, reserved, "TNT Minecart")) < 0) return;
         if ((flintSlot = take(mc, FLINT, reserved, "Flint and Steel")) < 0) return;
         if ((crossbowSlot = take(mc, CROSSBOW, reserved, "charged Crossbow")) < 0) return;
-        go(Stage.PREPARE_VERIFY, verifyWait(mc));
+        go(Stage.PREPARE_VERIFY, 0);
     }
 
     /** @return hotbar slot, or -1 after failing the sequence (item missing / no free slot). */
@@ -169,113 +171,82 @@ final class AutoCartController {
         if (found.isEmpty()) { fail(mc, "no valid rail position in front of you"); return; }
         spot = found.get();
         if (!McCompat.useItemOn(mc, spot.placeHit())) { fail(mc, "rail placement refused"); return; }
-        go(Stage.VERIFY_RAIL, verifyWait(mc));
-    }
-
-    private void verifyRail(Minecraft mc) {
-        // The client predicts the block instantly; we only look after waiting for the server's correction window.
-        BlockState state = mc.level.getBlockState(spot.rail());
-        if (!state.is(BlockTags.RAILS)) { fail(mc, "rail was not placed (rejected by server)"); return; }
-        go(Stage.PLACE_CART, cfg.stepDelayTicks);
+        go(Stage.PLACE_CART, 0);
     }
 
     private void placeCart(Minecraft mc) {
         if (!mc.level.getBlockState(spot.rail()).is(BlockTags.RAILS)) { fail(mc, "rail disappeared"); return; }
         if (!hold(mc, cartSlot, CART)) { fail(mc, "could not select TNT minecart"); return; }
-        preexistingCarts = new HashSet<>();
-        for (Entity e : cartsNear(mc)) preexistingCarts.add(e.getId());
         if (!McCompat.useItemOn(mc, spot.cartHit())) { fail(mc, "minecart placement refused"); return; }
-        go(Stage.VERIFY_CART, 0);
-    }
-
-    private void verifyCart(Minecraft mc) {
-        for (Entity e : cartsNear(mc)) {
-            if (!preexistingCarts.contains(e.getId())) {
-                cart = e;
-                warnedUnknownFuse = false;
-                lastPos = null;
-                stuckTicks = 0;
-                go(Stage.MOVE_BEHIND, cfg.stepDelayTicks);
-                return;
-            }
-        }
-        if (stageTicks > cfg.verifyTimeoutTicks + McCompat.pingTicks(mc) * 2) {
-            fail(mc, "TNT minecart did not appear (placement rejected)");
-        }
+        lastPos = null;
+        stuckTicks = 0;
+        go(Stage.MOVE_BEHIND, 0);
     }
 
     private void moveBehind(Minecraft mc) {
-        if (!cartAlive()) { fail(mc, "minecart vanished"); return; }
         LocalPlayer p = mc.player;
         Vec3 railC = spot.railCenter();
         double fx = spot.facing().getStepX(), fz = spot.facing().getStepZ();
 
-        // Position relative to the rail centre, split into axial (along the rail) and lateral parts.
+        // axial > 0 means "behind" the rail; must also be clear of the fire cell.
         double vx = p.getX() - railC.x, vz = p.getZ() - railC.z;
-        double axial = -(vx * fx + vz * fz);          // > 0 means "behind" the cart
+        double axial = -(vx * fx + vz * fz);
         double lateral = Math.abs(vx * fz - vz * fx);
-        double maxAxial = McCompat.entityRange(p) - 0.4;
-        boolean behind = axial >= 1.4 && axial <= maxAxial && lateral <= 0.6;
-
-        if (behind) {
-            go(Stage.IGNITE, cfg.stepDelayTicks);
+        if (axial >= 1.9 && axial <= 3.5 && lateral <= 0.6) {
+            go(Stage.IGNITE, 0);
             return;
         }
 
         Vec3 target = new Vec3(railC.x - fx * cfg.standDistance, p.getY(), railC.z - fz * cfg.standDistance);
         double dx = target.x - p.getX(), dz = target.z - p.getZ();
         double dist = Math.sqrt(dx * dx + dz * dz);
-        if (dist < 0.15) { go(Stage.IGNITE, cfg.stepDelayTicks); return; }
+        if (dist < 0.15) { go(Stage.IGNITE, 0); return; }
 
-        // Normal client-side movement (the client sends its usual position packets); camera is untouched.
         double s = Math.min(cfg.walkSpeed, dist);
         p.setDeltaMovement(dx / dist * s, p.getDeltaMovement().y, dz / dist * s);
 
         Vec3 now = p.position();
         if (lastPos != null && now.distanceToSqr(lastPos) < 0.0004) stuckTicks++; else stuckTicks = 0;
         lastPos = now;
-        if (stuckTicks > 10) fail(mc, "cannot reach a spot behind the minecart (blocked)");
+        if (stuckTicks > 10) fail(mc, "cannot reach a spot behind the rail (blocked)");
     }
 
+    /** Flint and steel on the floor block behind the rail: fire appears in the cell directly behind the rail. */
     private void ignite(Minecraft mc) {
-        if (!cartAlive()) { fail(mc, "minecart vanished"); return; }
         if (!hold(mc, flintSlot, FLINT)) { fail(mc, "could not select flint and steel"); return; }
-        if (!inReach(mc)) { fail(mc, "minecart out of reach"); return; }
-        Vec3 aim = cart.getBoundingBox().getCenter();
-        if (!McCompat.lineOfSight(mc, aim)) { fail(mc, "no line of sight to minecart"); return; }
-        if (!McCompat.interactEntity(mc, cart, aim.subtract(cart.position()))) {
-            fail(mc, "ignition interaction refused");
+
+        BlockPos firePos = spot.rail().relative(spot.facing().getOpposite());
+        BlockPos floor = firePos.below();
+        BlockState at = mc.level.getBlockState(firePos);
+        if (!at.canBeReplaced() || !at.getFluidState().isEmpty()) { fail(mc, "cell behind the rail is not free for fire"); return; }
+        if (!mc.level.getBlockState(floor).isFaceSturdy(mc.level, floor, Direction.UP)) { fail(mc, "no solid floor behind the rail"); return; }
+
+        Vec3 hitLoc = new Vec3(floor.getX() + 0.5, floor.getY() + 1.0, floor.getZ() + 0.5);
+        if (mc.player.getEyePosition().distanceTo(hitLoc) > McCompat.blockRange(mc.player) - 0.3) {
+            fail(mc, "fire position out of reach");
             return;
         }
-        go(Stage.VERIFY_IGNITE, verifyWait(mc));
-    }
-
-    private void verifyIgnite(Minecraft mc) {
-        if (!cartAlive()) { fail(mc, "minecart vanished before ignition was confirmed"); return; }
-        Boolean primed = McCompat.isPrimed(cart);
-        if (primed == null) {
-            // Cannot read the fuse on this version: continue, but tell the user once.
-            if (!warnedUnknownFuse) {
-                warnedUnknownFuse = true;
-                LOGGER.warn("Cannot read TNT minecart fuse state; ignition is not verifiable on this version.");
-            }
-            go(Stage.FIRE, cfg.fireDelayTicks);
+        if (!McCompat.useItemOn(mc, new BlockHitResult(hitLoc, Direction.UP, floor, false))) {
+            fail(mc, "flint and steel use refused");
             return;
         }
-        if (primed) { go(Stage.FIRE, cfg.fireDelayTicks); return; }
-        if (stageTicks > cfg.verifyTimeoutTicks + McCompat.pingTicks(mc) * 2) {
-            fail(mc, "minecart did not ignite");
-        }
+        go(Stage.FIRE, 0);
     }
 
+    /** Switch to the crossbow and shoot at the cart position so the arrow passes through the fire cell. */
     private void fire(Minecraft mc) {
         LocalPlayer p = mc.player;
-        if (!cartAlive()) { fail(mc, "minecart vanished"); return; }
         if (!hold(mc, crossbowSlot, CROSSBOW)) { fail(mc, "charged crossbow not selectable"); return; }
-        Vec3 aim = cart.getBoundingBox().getCenter();
+
+        BlockPos firePos = spot.rail().relative(spot.facing().getOpposite());
+        Vec3 rc = spot.railCenter();
+        Vec3 aim = new Vec3(rc.x, rc.y + 0.25, rc.z); // inside the cart's hitbox
+        Vec3 eye = p.getEyePosition();
+
+        if (new AABB(firePos).clip(eye, aim).isEmpty()) { fail(mc, "shot would not pass through the fire"); return; }
         if (!McCompat.lineOfSight(mc, aim)) { fail(mc, "no line of sight for the shot"); return; }
 
-        Vec3 d = aim.subtract(p.getEyePosition());
+        Vec3 d = aim.subtract(eye);
         double horiz = Math.sqrt(d.x * d.x + d.z * d.z);
         float yaw = (float) (Math.toDegrees(Math.atan2(d.z, d.x)) - 90.0);
         float pitch = (float) -Math.toDegrees(Math.atan2(d.y, horiz));
@@ -312,11 +283,6 @@ final class AutoCartController {
 
     private boolean cartAlive() { return cart != null && cart.isAlive() && !cart.isRemoved(); }
 
-    private boolean inReach(Minecraft mc) {
-        double r = McCompat.entityRange(mc.player) - 0.2;
-        return cart.getBoundingBox().distanceToSqr(mc.player.getEyePosition()) <= r * r;
-    }
-
     private List<Entity> cartsNear(Minecraft mc) {
         AABB box = new AABB(spot.rail()).inflate(0.5);
         return mc.level.getEntities((Entity) null, box, e -> e.getType() == EntityType.TNT_MINECART);
@@ -324,7 +290,6 @@ final class AutoCartController {
 
     private void fail(Minecraft mc, String reason) {
         LOGGER.warn("Sequence aborted at {}: {}", stage, reason);
-        if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[Auto Cart] Aborted: " + reason));
         end(mc, "FAILED - " + reason);
     }
 
@@ -341,6 +306,7 @@ final class AutoCartController {
     }
 
     private void show(Minecraft mc) {
+        if (!SHOW_STATUS) return;
         String text = enabled
                 ? "Auto Cart: ON - " + stage.label
                 : "Auto Cart: OFF" + (finalMsg == null ? "" : " - " + finalMsg);
