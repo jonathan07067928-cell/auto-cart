@@ -4,6 +4,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
@@ -53,10 +54,20 @@ final class McCompat {
         return r.consumesAction();
     }
 
-    /** Right-click an entity the same way vanilla does: interactAt first, then interact if not consumed. */
+    /** Right-click an entity (26.1: a single interact call that takes the hit result). */
     static boolean interactEntity(Minecraft mc, Entity target, Vec3 hitPoint) {
-              InteractionResult r = mc.gameMode.interact(mc.player, target, new EntityHitResult(target, hitPoint), InteractionHand.MAIN_HAND);
+        InteractionResult r = mc.gameMode.interact(mc.player, target, new EntityHitResult(target, hitPoint), InteractionHand.MAIN_HAND);
         return r.consumesAction();
+    }
+
+    /**
+     * Tell the server the player's rotation (normal move-player rotation packet) WITHOUT touching
+     * the local player's rotation, so the camera does not move.
+     */
+    static void sendRotation(Minecraft mc, float yaw, float pitch) {
+        LocalPlayer p = mc.player;
+        if (p == null || mc.getConnection() == null) return;
+        mc.getConnection().send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, p.onGround(), p.horizontalCollision));
     }
 
     /**
