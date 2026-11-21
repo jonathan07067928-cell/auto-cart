@@ -54,7 +54,7 @@ final class InventoryManager {
         if (dst < 0) return -1;
 
         Item item = p.getInventory().getItem(src).getItem();
-        mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, src, dst, ClickType.SWAP, p);
+                mc.gameMode.handleContainerInput(p.inventoryMenu.containerId, src, dst, ContainerInput.SWAP, p);
         swaps.push(new Swap(src, dst, item));
         return dst;
     }
@@ -86,7 +86,7 @@ final class InventoryManager {
             ItemStack inSlot = p.getInventory().getItem(s.hotbarSlot());
             // Only undo if the swap really happened (item is still there, or was fully consumed).
             if (inSlot.isEmpty() || inSlot.is(s.item())) {
-                mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, s.srcMenuSlot(), s.hotbarSlot(), ClickType.SWAP, p);
+                                mc.gameMode.handleContainerInput(p.inventoryMenu.containerId, s.srcMenuSlot(), s.hotbarSlot(), ContainerInput.SWAP, p);
             }
         }
         if (originalSelected >= 0) McCompat.selectSlot(p, originalSelected);
